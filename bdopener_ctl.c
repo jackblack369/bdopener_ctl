@@ -103,6 +103,13 @@ MODULE_PARM_DESC(skip_driver_release,
 	"Decrement bd_openers WITHOUT calling fops->release. Almost never what "
 	"you want: leaves dm's open_count high so dmsetup remove still fails.");
 
+static bool force_holder;
+module_param(force_holder, bool, 0644);
+MODULE_PARM_DESC(force_holder,
+	"Override the exclusive-holder veto. bd_holders > 0 means a live "
+	"claimant (mounted fs, dm, md, nvmet) owns a reference; releasing it "
+	"causes use-after-free. Setting this to 1 is almost always a mistake.");
+
 /* ------------------------------------------------------- version portability */
 /*
  * OVERRIDES - pass via ccflags-y in the Makefile if a vendor kernel disagrees
@@ -157,6 +164,24 @@ MODULE_PARM_DESC(skip_driver_release,
 #  define BDOC_OPENERS_DEC(bdev)	((bdev)->bd_openers--)
 #endif
 
+/*
+ * How many bd_holders our own open contributes.
+ *
+ * On >= 6.5 (bdev_open_by_dev / bdev_file_open_by_dev) a non-NULL holder makes
+ * the open EXCLUSIVE, so we take a holder slot ourselves. Before that,
+ * exclusivity came from FMODE_EXCL, which we do not pass, so we take none.
+ *
+ * Note that on >= 6.5 our exclusive open would itself fail with -EBUSY if a
+ * filesystem already held the device, so the veto below is belt-and-braces
+ * there; on <= 6.4 (incl. the 5.15 vendor kernels this was written for) the
+ * veto is the ONLY thing that sees the mounted filesystem.
+ */
+#if BDOC_HANDLE_API >= 1
+#  define BDOC_OUR_HOLDERS 1
+#else
+#  define BDOC_OUR_HOLDERS 0
+#endif
+
 /* Our holder cookie; distinguishes our own open from everyone else's. */
 static int bdoc_holder;
 
@@ -203,6 +228,29 @@ static void bdoc_close(struct bdoc_ref *ref)
 	blkdev_put(ref->bdev, FMODE_READ);
 #endif
 	ref->bdev = NULL;
+}
+
+/*
+ * Count exclusive claimants other than ourselves.
+ *
+ * bd_holders is incremented by bd_prepare_to_claim()/bd_link_disk_holder() for
+ * every EXCLUSIVE opener: a mounted filesystem's superblock, an upper dm
+ * target, md, LIO, nvmet's iblock backend, swapon, losetup. It is therefore a
+ * direct answer to the one question bd_openers cannot answer -- is this
+ * reference legitimately owned by something still alive?
+ *
+ * A leaked/orphaned reference has NO holder. A live consumer has one. Those two
+ * cases are numerically identical in bd_openers, which is exactly how forcing a
+ * release on a still-mounted filesystem became possible.
+ *
+ * bd_holders has existed since long before 4.18 and is still present in 6.12,
+ * so unlike bd_super (deleted in 6.0) it needs no version gate.
+ */
+static int bdoc_foreign_holders(struct block_device *bdev)
+{
+	int held = bdev->bd_holders - BDOC_OUR_HOLDERS;
+
+	return held > 0 ? held : 0;
 }
 
 /* Invoke the driver's release callback exactly as the real put path does. */
@@ -280,13 +328,30 @@ static void bdoc_report(struct block_device *bdev, dev_t dev)
 {
 	struct gendisk *disk = bdev->bd_disk;
 	long openers = BDOC_OPENERS_READ(bdev);
+	int held = bdoc_foreign_holders(bdev);
 
 	bdoc_emit("dev_t          : %u:%u\n", MAJOR(dev), MINOR(dev));
 	bdoc_emit("disk           : %s\n", disk && disk->disk_name[0] ? disk->disk_name : "?");
 	bdoc_emit("partno         : %d\n", bdev->bd_partno);
 	bdoc_emit("bd_openers     : %ld\n", openers);
 	bdoc_emit("  (includes 1 reference held by this module during inspect)\n");
-	bdoc_emit("leaked (est.)  : %ld\n", openers > 0 ? openers - 1 : 0);
+	bdoc_emit("unaccounted    : %ld   (bd_openers minus our own; NOT proof of a leak)\n",
+		  openers > 0 ? openers - 1 : 0);
+	bdoc_emit("bd_holders     : %d\n", bdev->bd_holders);
+	bdoc_emit("foreign holders: %d\n", held);
+	if (held > 0) {
+		bdoc_emit("verdict        : OWNED, NOT LEAKED -- release will be REFUSED\n");
+		bdoc_emit("  A live exclusive claimant holds this device. Look for a\n");
+		bdoc_emit("  mounted fs (/sys/fs/*/%s), upper dm, md, loop, swap,\n",
+			  disk && disk->disk_name[0] ? disk->disk_name : "<dev>");
+		bdoc_emit("  LIO, or an nvmet namespace. Release it at ITS layer.\n");
+	} else {
+		bdoc_emit("verdict        : no exclusive holder visible\n");
+		bdoc_emit("  Consistent with a leak, but NOT conclusive: a holder in a\n");
+		bdoc_emit("  hidden mount namespace can still exist. Run\n");
+		bdoc_emit("  find-bd-holder.sh and check /sys/fs/*/%s before releasing.\n",
+			  disk && disk->disk_name[0] ? disk->disk_name : "<dev>");
+	}
 	bdoc_emit("read_only      : %d\n", bdev_read_only(bdev) ? 1 : 0);
 	bdoc_emit("size (sectors) : %llu\n",
 		  (unsigned long long)bdev_nr_sectors(bdev));
@@ -327,7 +392,7 @@ static int bdoc_cmd_release(const char *path, long count, dev_t expect)
 	struct bdoc_ref ref;
 	dev_t dev;
 	long before, after, i;
-	int ret;
+	int ret, held;
 
 	if (!allow_release) {
 		bdoc_emit("refused: module loaded without allow_release=1\n");
@@ -371,6 +436,36 @@ static int bdoc_cmd_release(const char *path, long count, dev_t expect)
 		mutex_unlock(BDOC_LOCK(ref.bdev));
 		bdoc_close(&ref);
 		return -EINVAL;
+	}
+
+	/*
+	 * The provenance guard. bd_openers arithmetic cannot tell an orphaned
+	 * reference from one a live filesystem legitimately owns; bd_holders
+	 * can. Refuse when a foreign exclusive claimant exists -- releasing its
+	 * reference leaves it submitting I/O to a device the kernel believes is
+	 * idle, and leaves a superblock whose next real blkdev_put() underflows
+	 * the counter with no guard in the way.
+	 */
+	held = bdoc_foreign_holders(ref.bdev);
+	if (held > 0 && !force_holder) {
+		bdoc_emit("REFUSED: %d foreign exclusive holder(s) on this device "
+			  "(bd_holders=%d).\n", held, ref.bdev->bd_holders);
+		bdoc_emit("This reference is OWNED, not leaked. Releasing it "
+			  "risks use-after-free.\n");
+		bdoc_emit("Typical holders: a mounted filesystem (check "
+			  "/sys/fs/*/%s), an upper dm\n",
+			  ref.bdev->bd_disk ? ref.bdev->bd_disk->disk_name : "<dev>");
+		bdoc_emit("target, md, losetup, swap, LIO, or an nvmet namespace.\n");
+		bdoc_emit("Release it at ITS layer instead: umount (incl. hidden "
+			  "namespaces), or\n");
+		bdoc_emit("unlink the nvmet ns. If the mount is unreachable, "
+			  "reboot the node.\n");
+		pr_warn("bdopener_ctl: REFUSED release on %u:%u (%s): %d foreign "
+			"exclusive holder(s), reference is owned not leaked\n",
+			MAJOR(dev), MINOR(dev), path, held);
+		mutex_unlock(BDOC_LOCK(ref.bdev));
+		bdoc_close(&ref);
+		return -EBUSY;
 	}
 
 	for (i = 0; i < count; i++) {

@@ -313,15 +313,43 @@ fi
 
 # ------------------------------------------------------------------- verdict
 head2 "verdict"
-if (( FOUND == 0 )); then
+
+# A live superblock or a non-zero bd_holders means the reference is OWNED, not
+# leaked. This is a hard gate: forcing the count down in this state leaves a
+# live consumer submitting I/O to a device the kernel thinks is idle, and the
+# next real blkdev_put() underflows the counter. The observable symptom of
+# having done it anyway is a mount that fails with
+#   fsconfig() failed: File exists
+# because the zombie superblock still owns /sys/fs/<fs>/<kname>. Only a reboot
+# clears that.
+if (( SB )); then
+    printf '  *** DO NOT RELEASE ***\n'
+    printf '  A live filesystem superblock exists for %s.\n' "$KNAME"
+    printf '  The bd_openers reference is OWNED by that superblock, not leaked.\n\n'
+    printf '  Forcing it down will NOT let you remount. It leaves a zombie\n'
+    printf '  superblock, and the next mount fails with:\n'
+    printf '      fsconfig() failed: File exists\n'
+    printf '  (sysfs: cannot create duplicate filename /fs/<fs>/%s in dmesg)\n' "$KNAME"
+    printf '  Only a node reboot clears that state.\n\n'
+    printf '  Do this instead:\n'
+    printf '    1. findmnt -A -S %s        # find the mount, anywhere\n' "$DEV"
+    printf '    2. lsns -t mnt                  # NPROCS=0 + holder PID = fd-pinned\n'
+    printf '    3. umount it properly, or delete the pod/container pinning the ns\n'
+    printf '    4. if the mount is unreachable: drain + reboot the node\n'
+elif (( FOUND == 0 )); then
     cat <<'EOF'
-  Still no holder. Before forcing anything, exhaust these:
+  No holder found. Before forcing anything, exhaust these:
     1. Re-run with --mount-configfs if nvmet is loaded (see nvmet section).
     2. dmsetup remove --deferred <name>    # auto-removes when count drops
     3. dmsetup remove --force  <name>      # error target, then remove
     4. Compare dm 'open' above with the module's bd_openers reading:
          insmod bdopener_ctl.ko; echo 'inspect <dev>' > /proc/bdopener_ctl
        If dm open == 0 but bd_openers > 0, only the bdev counter is stale.
+
+  Note: "no holder found" is not proof of a leak. This scan is blind to a
+  holder in a mount namespace no live process exposes (and silently blind
+  entirely if nsenter is missing). The module's own bd_holders check is the
+  backstop -- if it refuses, believe it over this verdict.
 EOF
 else
     printf '  %d holder(s) identified. Release them at their own layer.\n' "$FOUND"

@@ -327,6 +327,46 @@ put path holds (`bd_disk->open_mutex` on ≥ 5.19, `bdev->bd_mutex` before).
 want, and is there for the case where you have already confirmed via
 `dmsetup info` that `open_count` is 0 while `bd_openers` is not.
 
+### The two guards, and what each one catches
+
+`release` refuses on two independent grounds. They answer different questions,
+and **the arithmetic one is not the important one**.
+
+```mermaid
+flowchart TD
+    REQ(["release &lt;dev&gt; &lt;count&gt; &lt;maj:min&gt; CONFIRM"]) --> G0{"allow_release=1 ·<br/>dev_t matches ·<br/>count in [1,64]?"}
+    G0 -- no --> R0["refuse<br/>-EPERM / -EINVAL"]
+
+    G0 -- yes --> G1{"<b>bd_openers >= count + 1</b><br/>arithmetic:<br/>would it underflow?"}
+    G1 -- no --> R1["refuse, -EINVAL"]
+
+    G1 -- yes --> G2{"<b>bd_holders - ours > 0</b><br/>provenance:<br/>is it OWNED?"}
+    G2 -- "yes → owned" --> R2["<b>REFUSE, -EBUSY</b><br/>a live claimant holds it<br/><i>this is the guard that<br/>matters</i>"]
+    G2 -- "no → unowned" --> GO["proceed:<br/>bd_openers-- + fops->release()"]
+
+    style R2 fill:#fadbd8,stroke:#c0392b,stroke-width:2px
+    style GO fill:#d5f5e3,stroke:#1e8449
+    style R0 fill:#f4f6f6,stroke:#7f8c8d
+    style R1 fill:#f4f6f6,stroke:#7f8c8d
+```
+
+**Why arithmetic alone is not enough.** The two cases are numerically identical:
+
+| | `bd_openers` | `bd_holders` | safe? |
+|---|---|---|---|
+| genuine leak | 2 (ours + orphan) | 0 | yes |
+| live superblock | 2 (ours + XFS) | 1 | **no — this is the corruption case** |
+
+`bd_openers >= count + 1` passes in *both*. Only `bd_holders` distinguishes
+them: it is incremented by `bd_prepare_to_claim()` for every **exclusive**
+claimant — a mounted filesystem's superblock, an upper dm target, md, LIO,
+`nvmet`'s iblock backend, `swapon`, `losetup`. An orphaned reference has no
+holder; a live consumer does.
+
+`force_holder=1` overrides the provenance veto. It is almost always a mistake;
+it exists only so a genuine leak that somehow registers a stale holder is still
+recoverable.
+
 ### Underflow is structurally impossible
 
 ```mermaid
@@ -342,6 +382,79 @@ The module opens the device itself before touching anything, so it always owns
 one live reference, and refuses unless `bd_openers >= count + 1`. **Do not
 relax that check** — it is the only thing standing between a typo and a
 negative refcount.
+
+---
+
+## Recovering from a release that should have been refused
+
+If you released a reference that a live filesystem owned, the LV **deactivates
+successfully** — and then the next mount fails:
+
+```text
+mount: .../mount: fsconfig() failed: File exists.
+```
+
+with this in `dmesg`:
+
+```text
+sysfs: cannot create duplicate filename '/fs/xfs/dm-5'
+  xfs_fs_get_tree → xfs_fs_fill_super → xfs_mountfs → [kobject_add] → -EEXIST
+```
+
+### What happened
+
+```mermaid
+flowchart TD
+    S1["fs live in an fd-pinned mount namespace<br/>bd_openers = 1 — legitimately owned by the superblock"]
+    S1 --> S2["release forces the counter to 0<br/>the superblock is untouched — the module cannot destroy one"]
+    S2 --> S3["lvchange -an now 'succeeds'<br/>the counter looks idle, so nothing objects"]
+    S3 --> S4["<b>zombie superblock</b><br/>still registered at /sys/fs/xfs/dm-5<br/>no mount, no fd, no way to reach it"]
+    S4 --> S5["next mount: xfs_mountfs → kobject_add → -EEXIST<br/>surfaced as 'fsconfig() failed: File exists'"]
+
+    style S1 fill:#eaf2f8,stroke:#2874a6
+    style S4 fill:#fadbd8,stroke:#c0392b,stroke-width:2px
+    style S5 fill:#fdebd0,stroke:#b9770e
+```
+
+The `EBUSY` you were trying to defeat was **correct** — it was the kernel
+accurately reporting a mounted filesystem. There was never a release-then-mount
+path here; the right outcome was for the release to refuse.
+
+Note the error message names the pod's mount directory, but that path is
+irrelevant: `fsconfig(FSCONFIG_CMD_CREATE)` builds the **superblock** and hasn't
+looked at the destination yet. Recreating or deleting that directory does
+nothing.
+
+### Fixing it
+
+```bash
+# confirm the zombie
+ls -la /sys/fs/xfs/          # an entry for a device with no mount = zombie
+findmnt -A -S /dev/<vg>/<lv> # reachable anywhere?
+```
+
+- **If a mount is reachable** — `umount` it properly. That retires the
+  superblock cleanly and no reboot is needed.
+- **If it is not reachable** — **drain and reboot the node.** A superblock with
+  no reachable mount cannot be destroyed from userspace: there is no umount
+  target, no fd, and no interface to unregister that kobject. This is the
+  correct fix, not a fallback.
+
+Two things to avoid while in this state:
+
+- **Stop the kubelet retry loop** (cordon, or scale the workload down). Every
+  backoff retry runs `xfs_mountfs` against a device whose refcounts are already
+  inconsistent. Deleting the pod does not help — it reschedules and retries.
+- **Do not run `release` again,** and do not `lvchange -ay` anything that might
+  land on the same dm minor. The forced decrement already consumed a reference
+  the zombie superblock still owns; when that fs is eventually put for real,
+  `blkdev_put()` decrements again — and the real put path has none of this
+  module's guards.
+
+**The LV's data is intact throughout.** It mounts normally after a reboot.
+
+> Since the `bd_holders` veto was added, `release` refuses this case outright,
+> so reaching this state now requires `force_holder=1`.
 
 ---
 
