@@ -165,24 +165,38 @@ MODULE_PARM_DESC(force_holder,
 #endif
 
 /*
- * How many bd_holders our own open contributes.
+ * Our own open MUST be non-exclusive, for two reasons:
  *
- * On >= 6.5 (bdev_open_by_dev / bdev_file_open_by_dev) a non-NULL holder makes
- * the open EXCLUSIVE, so we take a holder slot ourselves. Before that,
- * exclusivity came from FMODE_EXCL, which we do not pass, so we take none.
+ *  1. An exclusive open contributes to bd_holders, which is the very field the
+ *     provenance veto reads. Worse, the contribution is not 1: for a WHOLE
+ *     device bd_finish_claiming() increments bd_holders TWICE (once as
+ *     whole->bd_holders, again as bdev->bd_holders, and for a whole device
+ *     those are the same field). Subtracting a fixed 1 leaves a phantom
+ *     holder and the veto then refuses every release, genuine leaks included.
  *
- * Note that on >= 6.5 our exclusive open would itself fail with -EBUSY if a
- * filesystem already held the device, so the veto below is belt-and-braces
- * there; on <= 6.4 (incl. the 5.15 vendor kernels this was written for) the
- * veto is the ONLY thing that sees the mounted filesystem.
+ *  2. On >= 6.5 an exclusive open FAILS with -EBUSY when a filesystem already
+ *     holds the device -- so inspect would report nothing in exactly the case
+ *     you most need it.
+ *
+ * Non-exclusive means we contribute 0 to bd_holders, so any bd_holders > 0 is
+ * a foreign claimant. Pre-6.5 that is automatic (exclusivity came from
+ * FMODE_EXCL, which we never pass); from 6.5 it means passing a NULL holder.
  */
-#if BDOC_HANDLE_API >= 1
-#  define BDOC_OUR_HOLDERS 1
-#else
-#  define BDOC_OUR_HOLDERS 0
-#endif
+#define BDOC_OUR_HOLDERS 0
 
-/* Our holder cookie; distinguishes our own open from everyone else's. */
+/*
+ * Claims per claimant: 2 for a whole device (see the double-increment above),
+ * 1 for a partition. Used only to turn bd_holders into a human-readable
+ * claimant count -- the veto itself just tests for > 0.
+ */
+#define BDOC_CLAIMS_PER_HOLDER(bdev)	((bdev)->bd_partno == 0 ? 2 : 1)
+
+/*
+ * Holder cookie for the pre-6.5 path only. There, exclusivity comes from
+ * FMODE_EXCL (which we never pass), so the holder argument is inert and costs
+ * no bd_holders. From 6.5 the holder itself confers exclusivity, so that path
+ * passes NULL instead -- see bdoc_open().
+ */
 static int bdoc_holder;
 
 /* ------------------------------------------------------- open / close bridge */
@@ -200,13 +214,20 @@ static int bdoc_open(dev_t dev, struct bdoc_ref *ref)
 {
 	memset(ref, 0, sizeof(*ref));
 
+	/*
+	 * NULL holder, deliberately. From 6.5 a non-NULL holder makes the open
+	 * EXCLUSIVE, which would (a) contribute to bd_holders -- the very field
+	 * the provenance veto reads -- and (b) fail outright with -EBUSY when a
+	 * filesystem already holds the device, i.e. exactly when you need to
+	 * inspect. Non-exclusive keeps BDOC_OUR_HOLDERS at 0 on every API.
+	 */
 #if BDOC_HANDLE_API == 2
-	ref->file = bdev_file_open_by_dev(dev, BLK_OPEN_READ, &bdoc_holder, NULL);
+	ref->file = bdev_file_open_by_dev(dev, BLK_OPEN_READ, NULL, NULL);
 	if (IS_ERR(ref->file))
 		return PTR_ERR(ref->file);
 	ref->bdev = file_bdev(ref->file);
 #elif BDOC_HANDLE_API == 1
-	ref->handle = bdev_open_by_dev(dev, BLK_OPEN_READ, &bdoc_holder, NULL);
+	ref->handle = bdev_open_by_dev(dev, BLK_OPEN_READ, NULL, NULL);
 	if (IS_ERR(ref->handle))
 		return PTR_ERR(ref->handle);
 	ref->bdev = ref->handle->bdev;
@@ -337,14 +358,21 @@ static void bdoc_report(struct block_device *bdev, dev_t dev)
 	bdoc_emit("  (includes 1 reference held by this module during inspect)\n");
 	bdoc_emit("unaccounted    : %ld   (bd_openers minus our own; NOT proof of a leak)\n",
 		  openers > 0 ? openers - 1 : 0);
-	bdoc_emit("bd_holders     : %d\n", bdev->bd_holders);
-	bdoc_emit("foreign holders: %d\n", held);
+	bdoc_emit("bd_holders     : %d   (%d per claimant on a %s)\n",
+		  bdev->bd_holders, BDOC_CLAIMS_PER_HOLDER(bdev),
+		  bdev->bd_partno == 0 ? "whole device" : "partition");
+	bdoc_emit("foreign holders: %d claim(s) = ~%d claimant(s)\n",
+		  held, held / BDOC_CLAIMS_PER_HOLDER(bdev));
 	if (held > 0) {
 		bdoc_emit("verdict        : OWNED, NOT LEAKED -- release will be REFUSED\n");
 		bdoc_emit("  A live exclusive claimant holds this device. Look for a\n");
 		bdoc_emit("  mounted fs (/sys/fs/*/%s), upper dm, md, loop, swap,\n",
 			  disk && disk->disk_name[0] ? disk->disk_name : "<dev>");
 		bdoc_emit("  LIO, or an nvmet namespace. Release it at ITS layer.\n");
+		bdoc_emit("  If it is a filesystem with no reachable mount, you do NOT\n");
+		bdoc_emit("  need a reboot: /sys/fs/*/<disk> exists only while s_active>0,\n");
+		bdoc_emit("  so SOME reference is still held. Find and drop it -- the\n");
+		bdoc_emit("  superblock then unregisters itself and this count follows.\n");
 	} else {
 		bdoc_emit("verdict        : no exclusive holder visible\n");
 		bdoc_emit("  Consistent with a leak, but NOT conclusive: a holder in a\n");
@@ -448,18 +476,32 @@ static int bdoc_cmd_release(const char *path, long count, dev_t expect)
 	 */
 	held = bdoc_foreign_holders(ref.bdev);
 	if (held > 0 && !force_holder) {
-		bdoc_emit("REFUSED: %d foreign exclusive holder(s) on this device "
-			  "(bd_holders=%d).\n", held, ref.bdev->bd_holders);
+		const char *dname = ref.bdev->bd_disk ?
+				    ref.bdev->bd_disk->disk_name : "<dev>";
+
+		bdoc_emit("REFUSED: bd_holders=%d = %d claim(s) after excluding our "
+			  "own open\n", ref.bdev->bd_holders, held);
+		bdoc_emit("         = ~%d live claimant(s) (%d claim(s) each on a %s).\n",
+			  held / BDOC_CLAIMS_PER_HOLDER(ref.bdev),
+			  BDOC_CLAIMS_PER_HOLDER(ref.bdev),
+			  ref.bdev->bd_partno == 0 ? "whole device" : "partition");
 		bdoc_emit("This reference is OWNED, not leaked. Releasing it "
 			  "risks use-after-free.\n");
 		bdoc_emit("Typical holders: a mounted filesystem (check "
-			  "/sys/fs/*/%s), an upper dm\n",
-			  ref.bdev->bd_disk ? ref.bdev->bd_disk->disk_name : "<dev>");
+			  "/sys/fs/*/%s), an upper dm\n", dname);
 		bdoc_emit("target, md, losetup, swap, LIO, or an nvmet namespace.\n");
-		bdoc_emit("Release it at ITS layer instead: umount (incl. hidden "
-			  "namespaces), or\n");
-		bdoc_emit("unlink the nvmet ns. If the mount is unreachable, "
-			  "reboot the node.\n");
+		bdoc_emit("\n");
+		bdoc_emit("Forcing this (force_holder=1) CANNOT give you a working "
+			  "remount. It drops\n");
+		bdoc_emit("the COUNTER; the superblock survives, keeps /sys/fs/*/%s, "
+			  "and the next\n", dname);
+		bdoc_emit("mount fails with -EEXIST (\"fsconfig() failed: File "
+			  "exists\"). Retire the\n");
+		bdoc_emit("SUPERBLOCK instead -- that drops this count as a side "
+			  "effect:\n");
+		bdoc_emit("    ./unwedge-xfs-sb.sh --apply <dev>\n");
+		bdoc_emit("A reboot is only needed if that finds no reachable "
+			  "holder at all.\n");
 		pr_warn("bdopener_ctl: REFUSED release on %u:%u (%s): %d foreign "
 			"exclusive holder(s), reference is owned not leaked\n",
 			MAJOR(dev), MINOR(dev), path, held);

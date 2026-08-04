@@ -28,6 +28,7 @@ leaked.
 | File | Role |
 |------|------|
 | `find-bd-holder.sh` | read-only diagnostic — **run this first** |
+| `unwedge-xfs-sb.sh` | retire an orphaned superblock **without a reboot** — for `fsconfig() failed: File exists` |
 | `bdopener_ctl.c` | kernel module: inspect + forced release |
 | `Makefile` | build / load / probe |
 
@@ -265,7 +266,11 @@ looking, so `bd_openers` reads one higher than what LVM reports.
 ### Release (destructive to kernel state — LV data untouched)
 
 ```bash
+# remove and reload the module
 sudo rmmod bdopener_ctl
+
+# set allow_release=1 to enable the release path; the module will refuse to release if a live holder exists
+# add force_holder=1 to override the provenance veto (almost always a mistake which should resolve by unwedge-xfs-sb.sh)
 sudo insmod ./bdopener_ctl.ko allow_release=1
 
 # count and dev_t must both match what inspect reported
@@ -433,12 +438,61 @@ ls -la /sys/fs/xfs/          # an entry for a device with no mount = zombie
 findmnt -A -S /dev/<vg>/<lv> # reachable anywhere?
 ```
 
-- **If a mount is reachable** — `umount` it properly. That retires the
-  superblock cleanly and no reboot is needed.
-- **If it is not reachable** — **drain and reboot the node.** A superblock with
-  no reachable mount cannot be destroyed from userspace: there is no umount
-  target, no fd, and no interface to unregister that kobject. This is the
-  correct fix, not a fallback.
+### Clearing it without a reboot
+
+A reboot is the fallback, **not** the first answer. `/sys/fs/xfs/<disk>` is
+created by `xfs_mountfs()` and removed by `->kill_sb()`, which runs the instant
+the superblock's `s_active` reaches zero. So **the directory existing proves
+`s_active > 0`, which proves something still holds a reference.** A superblock
+held by nothing cannot exist. "Reboot is the only option" always actually means
+*"I did not find the holder"* or *"the holder would not die"* — and both are
+attackable:
+
+```bash
+sudo ./unwedge-xfs-sb.sh /dev/csi-lvm/pvc-...            # report only
+sudo ./unwedge-xfs-sb.sh --apply /dev/csi-lvm/pvc-...    # act
+```
+
+```mermaid
+flowchart TD
+    Z(["/sys/fs/xfs/dm-N exists<br/>⇒ s_active &gt; 0 ⇒ a reference is held"]) --> S1
+
+    S1{"① mount listed in<br/>any namespace?"}
+    S1 -- yes --> U1["nsenter --target PID --mount umount MP"] --> WIN
+    S1 -- no --> S2{"② pinned ns?<br/>fd or bind — both<br/>invisible to lsns"}
+    S2 -- yes --> U2["nsenter --mount=&lt;pin&gt; umount -l MP"] --> WIN
+    S2 -- no --> S3{"③ open fd / cwd / root<br/>on the fs?<br/>(st_dev scan)"}
+    S3 -- yes --> U3["SIGTERM, then SIGKILL<br/>the holders"] --> K{"died?"}
+    K -- yes --> WIN
+    K -- "no: D-state" --> S4["④ abort the I/O they wait on<br/>error/*/max_retries = 0<br/>xfs_io -x -c 'shutdown -f'"]
+    S4 --> WIN
+    S3 -- no --> BOOT["nothing reachable<br/>⇒ reboot is the honest answer"]
+
+    WIN(["/sys/fs/xfs/dm-N gone<br/>remount works on this node"])
+
+    style Z fill:#fadbd8,stroke:#c0392b
+    style WIN fill:#d5f5e3,stroke:#1e8449
+    style S4 fill:#fdebd0,stroke:#b9770e
+    style BOOT fill:#f4f6f6,stroke:#7f8c8d
+```
+
+Steps ① and ② are ordinary unmounts. ③ loses unflushed writes **in the killed
+processes only**. ④ is the one that needs explaining:
+
+**Why `xfs_io -x -c shutdown` is safe.** It aborts in-flight and future I/O with
+`EIO` — exactly what XFS does to itself on a fatal error. That is what lets a
+task blocked in `D` state return from the kernel, die, and drop its reference. A
+`D`-state holder **cannot** be killed any other way: `SIGKILL` is not delivered
+until the task leaves the kernel, and it will not leave while waiting on I/O
+that never completes. Metadata is journalled, so the log replays on the next
+mount. **No data at rest is lost.**
+
+If `find-bd-holder.sh` reports paths as *skipped*, the `st_dev` scan at step ③
+did not run — resolve that before believing a "nothing reachable" verdict, since
+that's precisely the check that separates ③ from a reboot.
+
+Reboot only when ①–④ all come up empty: no umount target, no fd, no namespace,
+and no interface to unregister the kobject.
 
 Two things to avoid while in this state:
 

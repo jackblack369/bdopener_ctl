@@ -34,23 +34,37 @@ hit()  { printf '  >> HOLDER: %s\n' "$*"; }
 susp() { printf '  ?? SUSPECT: %s\n' "$*"; }
 note() { printf '     %s\n' "$*"; }
 # true only when the value is a plain decimal integer -- the only kind safe to
-# feed into (( )). %r is hex and some stat builds print '?' for st_rdev.
+# feed into (( )). Some stat builds print '?' or a literal '%r' for st_rdev.
 decdev() { [[ $1 =~ ^[0-9]+$ ]]; }
-# Print "st_rdev st_dev" as DECIMAL for path $1, or fail. GNU coreutils %R/%d
-# are already decimal; some stat builds (e.g. busybox) print '?' for %R, so
-# fall back to %t/%T (hex major/minor) to rebuild st_rdev. st_dev is then
-# unknown (0), so on such hosts only direct device-node opens are matched.
-devnums() {
-    local p=$1 fr d fm fn
-    read -r fr d < <(stat -L -c '%R %d' "$p" 2>/dev/null) || return 1
-    if decdev "${fr:-}" && decdev "${d:-}"; then
-        printf '%s %s\n' "$fr" "$d"
-        return 0
-    fi
-    read -r fm fn < <(stat -L -c '%t %T' "$p" 2>/dev/null) || return 1
-    [[ $fm =~ ^[0-9a-fA-F]+$ && $fn =~ ^[0-9a-fA-F]+$ ]] || return 1
-    (( MAJ == 0 && MIN == 0 )) && return 1
-    printf '%s 0\n' "$(( ((0x$fm & 0xfff) << 8) | (0x$fn & 0xff) | ((0x$fn & ~0xff) << 12) ))"
+hexdev() { [[ $1 =~ ^[0-9a-fA-F]+$ ]]; }
+#
+# How path $1 relates to the target device. Echoes rdev | dev | none.
+#
+#   rdev -> an open fd on the BLOCK DEVICE NODE itself
+#   dev  -> an open FILE on a filesystem mounted from it (the lazy-unmount case)
+#
+# v2.2: the v2/v2.1 version required BOTH fields to be plain decimal and bailed
+# otherwise. On GNU coreutils %R is st_rdev in HEX (dm-9 prints "fd09"), so the
+# digit test failed on every path, the usable decimal %d was discarded with it,
+# and the whole scan silently reported thousands of "skipped" -- i.e. the check
+# that decides "recoverable" vs "must reboot" never actually ran.
+#
+# Which of %r/%R is decimal has varied across coreutils versions, so trust
+# neither: accept a match on ANY plausible reading of st_rdev, evaluate st_dev
+# independently, and never let one unreadable field abort the other.
+devkind() {
+    local p=$1 R d r n
+    read -r R d r < <(stat -L -c '%R %d %r' "$p" 2>/dev/null) || return 1
+    for n in "${R:-}" "${r:-}"; do
+        [[ -n $n ]] || continue
+        # 10#/16# prefixes are mandatory: a zero-padded value would otherwise
+        # be read as octal, and a hex one would abort (( )) with a syntax error.
+        decdev "$n" && (( 10#$n == STDEV ))   && { printf 'rdev\n'; return 0; }
+        hexdev "$n" && (( 16#$n == STDEV ))   && { printf 'rdev\n'; return 0; }
+    done
+    decdev "${d:-}" || return 1
+    (( 10#$d == STDEV )) && { printf 'dev\n'; return 0; }
+    printf 'none\n'
 }
 
 [[ -b $DEV ]] || die "$DEV is not a block special file"
@@ -103,9 +117,11 @@ fi
 # ------------------------------------------------ ORPHANED SUPERBLOCK (new, key)
 head2 "live filesystem superblock on $KNAME (survives lazy unmount)"
 SB=0
+FSTYPE_SB=""
 for fs in ext4 ext3 xfs btrfs f2fs; do
     if [[ -d /sys/fs/$fs/$KNAME ]]; then
         SB=1
+        FSTYPE_SB=$fs
         mark "a live $fs superblock exists at /sys/fs/$fs/$KNAME"
         note "The filesystem is still MOUNTED-OR-ORPHANED in the kernel. If no"
         note "mountpoint exists, it was lazily unmounted (umount -l) while a file"
@@ -114,7 +130,8 @@ for fs in ext4 ext3 xfs btrfs f2fs; do
     fi
 done
 if compgen -G "/proc/fs/jbd2/${KNAME}-*" >/dev/null; then
-    SB=1; mark "active jbd2 journal: $(ls -d /proc/fs/jbd2/${KNAME}-* 2>/dev/null | xargs)"
+    SB=1; FSTYPE_SB=${FSTYPE_SB:-ext4}
+    mark "active jbd2 journal: $(ls -d /proc/fs/jbd2/${KNAME}-* 2>/dev/null | xargs)"
 fi
 ((SB)) || note "no live superblock for this device"
 
@@ -209,20 +226,21 @@ grep -qF "$REAL" /proc/swaps 2>/dev/null && mark "swap: $(grep -F "$REAL" /proc/
 
 # ------------------------------------------------------------ mounts, all ns
 head2 "mounts referencing $DEVT (per-process namespaces)"
-any=0
+MOUNTED=0
 for mi in /proc/[0-9]*/mountinfo; do
     [[ -r $mi ]] || continue
     while read -r _ _ mm rest; do
         [[ $mm == "$DEVT" ]] || continue
-        pid=$(cut -d/ -f3 <<<"$mi"); any=1
+        pid=$(cut -d/ -f3 <<<"$mi"); MOUNTED=1
         mark "pid $pid ($(cat /proc/"$pid"/comm 2>/dev/null)): $rest"
     done <"$mi"
 done
-((any)) || note "none"
+((MOUNTED)) || note "none"
 
 # ------------------------------- fd-pinned mount namespaces (no process at all)
-head2 "mount namespaces pinned by an fd (invisible to the scan above)"
+head2 "mount namespaces pinned by an fd or a bind mount (invisible to the scan above)"
 NSFD=0
+NSSKIP=0
 for l in /proc/[0-9]*/fd/*; do
     [[ -L $l ]] || continue
     tgt=$(readlink "$l" 2>/dev/null) || continue
@@ -236,34 +254,57 @@ for l in /proc/[0-9]*/fd/*; do
         fi
     fi
 done
+# A BIND-pinned namespace (snapd's /run/snapd/ns/*.mnt, `mount --bind` of
+# /proc/<pid>/ns/mnt) has no fd and no process, so it is absent from both the
+# loop above AND from `lsns`. findmnt is the only thing that lists them.
+if command -v findmnt >/dev/null; then
+    while read -r tgt; do
+        [[ -n $tgt ]] || continue
+        if out=$(nsenter --mount="$tgt" -- cat /proc/self/mountinfo 2>/dev/null); then
+            if grep -q " $DEVT " <<<"$out"; then
+                NSFD=1
+                mark "bind-pinned mount ns at $tgt still mounts $DEVT"
+                note "fix: nsenter --mount=$tgt umount <target>"
+            fi
+        else
+            # Expected for the common case: net/uts/ipc namespaces are also
+            # nsfs, and --mount rejects them. Only worth reporting in bulk.
+            NSSKIP=$((NSSKIP + 1))
+        fi
+    done < <(findmnt -rno TARGET,FSTYPE 2>/dev/null | awk '$2=="nsfs"{print $1}')
+fi
+((NSSKIP)) && note "$NSSKIP pinned nsfs entr(ies) were not mount namespaces (net/uts/ipc) - not applicable"
 ((NSFD)) || note "none found (nsenter may fail for namespaces lacking /bin/cat)"
 
 # ----------------------------- process refs: st_rdev AND st_dev (v1 missed st_dev)
 head2 "process references (matches both device-node fds and open files on the fs)"
 any=0
 BADSTAT=0
+FDPIN=0   # a process holds the fs open => the superblock is REACHABLE, no reboot
 for p in /proc/[0-9]*; do
     pid=${p#/proc/}
     comm=$(cat "$p/comm" 2>/dev/null) || continue
 
     for l in "$p"/fd/*; do
         [[ -e $l ]] || continue
-        read -r frdev fdev < <(devnums "$l") || { BADSTAT=$((BADSTAT + 1)); continue; }
-        if (( frdev == STDEV )); then
-            any=1; mark "pid $pid ($comm) fd $(basename "$l") -> the BLOCK DEVICE $(readlink "$l")"
-        elif (( fdev == STDEV )); then
-            any=1; mark "pid $pid ($comm) fd $(basename "$l") -> FILE on the fs: $(readlink "$l")"
-            note "an open file keeps the superblock, and thus the bdev, alive"
-        fi
+        k=$(devkind "$l") || { BADSTAT=$((BADSTAT + 1)); continue; }
+        case $k in
+          rdev) any=1; mark "pid $pid ($comm) fd $(basename "$l") -> the BLOCK DEVICE $(readlink "$l")";;
+          dev)  any=1; mark "pid $pid ($comm) fd $(basename "$l") -> FILE on the fs: $(readlink "$l")"
+                note "an open file keeps the superblock, and thus the bdev, alive"
+                note "closing it (or killing this pid) retires the superblock -- no reboot needed"
+                FDPIN=1;;
+        esac
     done
 
     if [[ -r $p/maps ]] && grep -q " $MAPS_DEVT " "$p/maps" 2>/dev/null; then
         any=1; mark "pid $pid ($comm) has a file from this device mmap'd"
     fi
     for sp in cwd root exe; do
-        read -r srdev sdev < <(devnums "$p/$sp") || { BADSTAT=$((BADSTAT + 1)); continue; }
-        if (( srdev == STDEV || sdev == STDEV )); then
+        k=$(devkind "$p/$sp") || { BADSTAT=$((BADSTAT + 1)); continue; }
+        if [[ $k != none ]]; then
             any=1; mark "pid $pid ($comm) $sp is on this device"
+            FDPIN=1
         fi
     done
 done
@@ -329,13 +370,37 @@ if (( SB )); then
     printf '  Forcing it down will NOT let you remount. It leaves a zombie\n'
     printf '  superblock, and the next mount fails with:\n'
     printf '      fsconfig() failed: File exists\n'
-    printf '  (sysfs: cannot create duplicate filename /fs/<fs>/%s in dmesg)\n' "$KNAME"
-    printf '  Only a node reboot clears that state.\n\n'
-    printf '  Do this instead:\n'
-    printf '    1. findmnt -A -S %s        # find the mount, anywhere\n' "$DEV"
-    printf '    2. lsns -t mnt                  # NPROCS=0 + holder PID = fd-pinned\n'
-    printf '    3. umount it properly, or delete the pod/container pinning the ns\n'
-    printf '    4. if the mount is unreachable: drain + reboot the node\n'
+    printf '  (sysfs: cannot create duplicate filename /fs/<fs>/%s in dmesg)\n\n' "$KNAME"
+
+    # The whole point of the st_dev scan: a superblock kept alive by a process
+    # is REACHABLE, so this is repairable in place. One with no mount, no fd and
+    # no namespace has no userspace handle at all -- umount needs a mountpoint,
+    # xfs_io -c shutdown needs a mount path, and the fs sysfs dir exposes stats
+    # and error knobs only. Nothing can retire it, hence the reboot.
+    if (( MOUNTED || FDPIN || NSFD )); then
+        printf '  RECOVERABLE IN PLACE -- a live handle to it was found above.\n'
+        printf '  No reboot needed. Retire the superblock through that handle:\n'
+        printf '    * mount listed        -> umount it (add -f if the backing store is gone)\n'
+        printf '    * open file / cwd     -> close the fd, or kill the pid shown\n'
+        printf '    * fd-pinned namespace -> nsenter --mnt=<fd> umount <target>\n'
+        printf '  Then re-run this script: the superblock and the count both go away.\n'
+    else
+        printf '  NO HANDLE FOUND by this scan -- but note what that does and does\n'
+        printf '  not prove. /sys/fs/%s/%s is removed by ->kill_sb(), which runs as\n' "$FSTYPE_SB" "$KNAME"
+        printf '  soon as s_active hits 0. Its existence therefore PROVES a reference\n'
+        printf '  is still held. A superblock held by nothing cannot exist, so this\n'
+        printf '  is a scan limit, not a verdict.\n\n'
+        printf '  Escalate before reaching for a reboot:\n'
+        printf '    sudo ./unwedge-xfs-sb.sh --apply %s\n\n' "$DEV"
+        printf '  It covers what this scan cannot: bind-pinned namespaces (no fd, no\n'
+        printf '  process -- invisible to lsns too), and D-state holders that ignore\n'
+        printf '  SIGKILL until their stuck I/O is aborted.\n'
+        printf '  Reboot only if that also comes up empty. LV data is intact either way.\n'
+        (( BADSTAT )) && printf '\n  CAVEAT: %d path(s) were skipped above, so "no fd" is unproven\n' "$BADSTAT"
+        (( BADSTAT )) && printf '  on this host. Resolve that first -- it is the check that decides\n'
+        (( BADSTAT )) && printf '  recoverable-vs-reboot.\n'
+    fi
+    printf '\n  Either way: do NOT use force_holder=1. The holder is real.\n'
 elif (( FOUND == 0 )); then
     cat <<'EOF'
   No holder found. Before forcing anything, exhaust these:
