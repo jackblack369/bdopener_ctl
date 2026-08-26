@@ -112,22 +112,28 @@ MODULE_PARM_DESC(force_holder,
 
 /* ------------------------------------------------------- version portability */
 /*
- * OVERRIDES - pass via ccflags-y in the Makefile if a vendor kernel disagrees
- * with the LINUX_VERSION_CODE heuristics below:
+ * The three things that moved between 5.15 and 6.9 did NOT move together, and
+ * distro kernels backport them out of order. So the Makefile greps the headers
+ * it is about to compile against and passes the answers in as -D flags; the
+ * LINUX_VERSION_CODE tests below are only a fallback for when that grep cannot
+ * read a header. Trust `make probe` over the numbers here.
  *
- *   -DBDOC_LOCK_IN_GENDISK=1   bd_disk->open_mutex   (mainline >= 5.19)
- *   -DBDOC_LOCK_IN_GENDISK=0   bdev->bd_mutex        (mainline <  5.19)
- *   -DBDOC_OPENERS_ATOMIC=1    bd_openers is atomic_t
+ *   -DBDOC_LOCK_IN_GENDISK=1   bd_disk->open_mutex    (>= 5.15)
+ *   -DBDOC_LOCK_IN_GENDISK=0   bdev->bd_mutex         (<  5.15)
+ *   -DBDOC_OPENERS_ATOMIC=1    bd_openers is atomic_t (mid-6.x; 6.8 is atomic)
+ *   -DBDOC_OPENERS_ATOMIC=0    bd_openers is int      (5.15 is int)
  *   -DBDOC_HANDLE_API=2        bdev_file_open_by_dev  (>= 6.9)
  *   -DBDOC_HANDLE_API=1        bdev_open_by_dev       (>= 6.5)
  *   -DBDOC_HANDLE_API=0        blkdev_get_by_dev      (<  6.5)
  *
  * Verify against your tree:
- *   grep -n 'bd_openers\|open_mutex' /lib/modules/$(uname -r)/build/include/linux/blk_types.h
+ *   grep -n 'bd_openers' /lib/modules/$(uname -r)/build/include/linux/blk_types.h
+ *   grep -n 'open_mutex' /lib/modules/$(uname -r)/build/include/linux/{blkdev,genhd}.h
  */
 
 #ifndef BDOC_LOCK_IN_GENDISK
-#  if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+   /* 5.15 moved bd_mutex into gendisk as open_mutex (a8698707a1e2). */
+#  if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 #    define BDOC_LOCK_IN_GENDISK 1
 #  else
 #    define BDOC_LOCK_IN_GENDISK 0
@@ -145,7 +151,17 @@ MODULE_PARM_DESC(force_holder,
 #endif
 
 #ifndef BDOC_OPENERS_ATOMIC
-#  define BDOC_OPENERS_ATOMIC 0
+   /*
+    * bd_openers became atomic_t during 6.x. atomic_t is a struct, so getting
+    * this wrong is not subtle -- reads fail with "aggregate value used where an
+    * integer was expected" and the decrement with "wrong type argument to
+    * decrement". 6.3 is a best guess; the Makefile's grep is authoritative.
+    */
+#  if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#    define BDOC_OPENERS_ATOMIC 1
+#  else
+#    define BDOC_OPENERS_ATOMIC 0
+#  endif
 #endif
 
 #if BDOC_LOCK_IN_GENDISK
@@ -191,13 +207,16 @@ MODULE_PARM_DESC(force_holder,
  */
 #define BDOC_CLAIMS_PER_HOLDER(bdev)	((bdev)->bd_partno == 0 ? 2 : 1)
 
+#if BDOC_HANDLE_API == 0
 /*
- * Holder cookie for the pre-6.5 path only. There, exclusivity comes from
- * FMODE_EXCL (which we never pass), so the holder argument is inert and costs
- * no bd_holders. From 6.5 the holder itself confers exclusivity, so that path
- * passes NULL instead -- see bdoc_open().
+ * Holder cookie for the pre-6.5 path only, hence the #if: from 6.5 the holder
+ * argument is what MAKES an open exclusive, so those paths pass NULL and this
+ * would be an unused variable. Pre-6.5 exclusivity came from FMODE_EXCL, which
+ * we never pass, so the cookie is inert and costs no bd_holders either way.
+ * See bdoc_open().
  */
 static int bdoc_holder;
+#endif
 
 /* ------------------------------------------------------- open / close bridge */
 

@@ -195,10 +195,19 @@ make probe    # confirm headers exist and show which struct layout was detected
 make
 ```
 
-`make probe` prints where `bd_openers` and `open_mutex` live in your tree. If
-the build fails, the version heuristics guessed wrong for your vendor kernel —
-set the `-DBDOC_*` overrides in the `Makefile` per the `OVERRIDES` block in the
-`.c`.
+The `Makefile` greps the headers it is about to compile against and sets the
+`-DBDOC_*` flags from what it finds, so the same tree builds unmodified on
+5.15 and 6.8 — where `bd_openers` is `int` and `atomic_t` respectively, and the
+open API is `blkdev_get_by_dev` and `bdev_open_by_dev`. `make probe` prints
+the flags it chose plus the header lines they came from.
+
+Do **not** hardcode a `-DBDOC_*` in the `Makefile`: whatever value fixes one
+kernel is wrong on the other. If a build still fails, the header grep missed —
+send the `make probe` output.
+
+Symptoms of a wrong `BDOC_OPENERS_ATOMIC`: `aggregate value used where an
+integer was expected` and `wrong type argument to decrement`. `atomic_t` is a
+struct, so the mismatch is always a hard error, never silent.
 
 Building requires headers on the node and, if Secure Boot is on, a signed
 module. On an immutable/CoreOS-style host you will need a `kmod-via-container`
@@ -326,7 +335,7 @@ flowchart LR
 Decrementing only `bd_openers` leaves you just as busy, now with a counter that
 disagrees with reality. So `release` replays a **complete `blkdev_put()`**:
 decrement, then invoke `disk->fops->release()`, under the same lock the real
-put path holds (`bd_disk->open_mutex` on ≥ 5.19, `bdev->bd_mutex` before).
+put path holds (`bd_disk->open_mutex` on ≥ 5.15, `bdev->bd_mutex` before).
 
 `skip_driver_release=1` exists to decrement only. It is almost never what you
 want, and is there for the case where you have already confirmed via
